@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -176,4 +178,79 @@ var timeout = time.Duration(5 * time.Second)
 func dialTimeout(ctx context.Context, network, addr string) (net.Conn, error) {
 	d := net.Dialer{Timeout: timeout}
 	return d.DialContext(ctx, network, addr)
+}
+
+// InspectError returns a struct containing information about the error
+// it was given.
+func InspectError(err *acmecl.Error) *ErrorInfo {
+	problem := getProblem(err.Type)
+
+	info := &ErrorInfo{
+		Error: err,
+	}
+	if problem == "compound" {
+		for _, s := range err.Subproblems {
+			addProblem(info, getProblem(s.Type))
+		}
+		return info
+	}
+	addProblem(info, problem)
+	return info
+}
+
+func getProblem(s string) string {
+	// Letsencrypt/boulder currently uses a non-IETF namespace for its URNs,
+	// but the last element follows
+	// Other implementations have been known to use lower-case for their URNs
+
+	split := strings.Split(s, ":")
+	return strings.ToLower(split[len(split)-1])
+}
+
+func addProblem(info *ErrorInfo, problem string) {
+	switch problem {
+	case "ratelimited":
+		info.Ratelimit = true
+		info.RetryAt = retryAt(info.Error.Header.Get("Retry-After"))
+	case "accountdoesnotexist", "invalidcontact", "rejectedidentifier", "unauthorized", "unsupportedcontact",
+		"unsupportedidentifier":
+		info.NeedsConfigChange = true
+	case "alreadyrevoked", "serverinternal", "badrevocationreason":
+		// TODO(dmo): figure these ones out
+	case "badcsr", "badsignaturealgorithm", "incorrectresponse", "malformed", "tls":
+		info.LogicError = true
+	case "badnonce":
+		info.RetryAt = time.Now().Add(-1 * time.Second)
+	case "caa", "dns", "externalaccountrequired", "useractionrequired":
+		info.NeedsRemediation = true
+	default:
+		// TODO(dmo): figure out the right thing here
+	}
+}
+
+type ErrorInfo struct {
+	Error             *acmecl.Error
+	NeedsConfigChange bool
+	NeedsRemediation  bool
+
+	LogicError bool
+
+	Ratelimit bool
+	RetryAt   time.Time
+}
+
+// retryAt parses a Retry-After HTTP header value,
+// trying to convert v into an int (seconds) or use http.ParseTime otherwise.
+// It returns zero time if v cannot be parsed.
+//
+// Copied from x/crypto/acme
+func retryAt(v string) time.Time {
+	if i, err := strconv.Atoi(v); err == nil {
+		return time.Now().Add(time.Duration(i) * time.Second)
+	}
+	t, err := http.ParseTime(v)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
