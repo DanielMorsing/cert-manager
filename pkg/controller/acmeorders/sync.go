@@ -80,8 +80,16 @@ func (c *Controller) Sync(ctx context.Context, o *cmapi.Order) (err error) {
 			// 4xx error codes include rate limit errors (429).
 			// This will cause the Certificate controller to retry the Order
 			// after the regular back-off algorithm has been applied.
-			acmeErr, ok := err.(*acmeapi.Error)
-			if ok && acmeErr.StatusCode >= 400 && acmeErr.StatusCode < 500 {
+			var acmeErr *acmeapi.Error
+			switch t := err.(type) {
+			default:
+				return err
+			case *acmeapi.Error:
+				acmeErr = t
+			case acmeapi.OrderInvalidError:
+				acmeErr = t.Order.Error
+			}
+			if acmeErr.StatusCode >= 400 && acmeErr.StatusCode < 500 {
 				c.setOrderState(&o.Status, cmapi.Errored)
 				o.Status.Reason = fmt.Sprintf("Failed to create order: %v", err)
 				return err
@@ -353,7 +361,7 @@ func (c *Controller) createOrder(ctx context.Context, cl acmecl.Interface, issue
 	orderTemplate := acmeapi.NewOrder(identifierSet.List()...)
 	acmeOrder, err := cl.CreateOrder(ctx, orderTemplate)
 	if err != nil {
-		return fmt.Errorf("error creating new order: %v", err)
+		return err
 	}
 
 	c.setOrderStatus(&o.Status, acmeOrder)
